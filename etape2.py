@@ -6,78 +6,110 @@ import matplotlib.pyplot as plt
 import cv2 as cv
 import numpy as np
 
+# ===============================
+# 1. Chargement FITS
+# ===============================
 fits_file = './examples/HorseHead.fits'
 hdul = fits.open(fits_file)
 data = hdul[0].data.astype(np.float32)
 hdul.close()
 
-# Normalisation [0,255]
+# ===============================
+# 2. Normalisation
+# ===============================
 img_norm = cv.normalize(data, None, 0, 255, cv.NORM_MINMAX)
 img_uint8 = img_norm.astype(np.uint8)
-
-# Image originale float
 Ioriginal = img_uint8.astype(np.float32)
 
-# Statistiques du fond de ciel
+# ===============================
+# 3. Statistiques fond de ciel
+# ===============================
 mean, median, std = sigma_clipped_stats(data, sigma=3.0)
 
-# Détecteur d'étoiles
+# ===============================
+# 4. MASQUE DAO (petites étoiles)
+# ===============================
 daofind = DAOStarFinder(
-    fwhm=3.0,           # taille moyenne des étoiles
-    threshold=1.0 * std # seuil de détection
+    fwhm=3.0,
+    threshold=1.0 * std
 )
 
 sources = daofind(data - median)
 
-# Création du masque vide
-mask = np.zeros(img_uint8.shape, dtype=np.uint8)
+mask_dao = np.zeros(img_uint8.shape, dtype=np.uint8)
 
-# Dessin des étoiles dans le masque
 if sources is not None:
     for star in sources:
         x = int(star['xcentroid'])
         y = int(star['ycentroid'])
-        cv.circle(mask, (x, y), 5, 255, -1)
+        cv.circle(mask_dao, (x, y), 5, 255, -1)
 
-# Nettoyage léger
-kernel = np.ones((3, 3), np.uint8)
-mask = cv.dilate(mask, kernel, iterations=1)
+mask_dao = cv.dilate(mask_dao, np.ones((3,3),np.uint8), iterations=1)
 
-# Flou pour transitions douces
-mask_blur = cv.GaussianBlur(mask, (15, 15), 0)
+# ===============================
+# 5. MASQUE ADAPTATIF (grosses étoiles)
+# ===============================
+mask_adapt = cv.adaptiveThreshold(
+    img_uint8, 255,
+    cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+    cv.THRESH_BINARY,
+    31, -5
+)
 
-# Masque normalisé [0,1]
-M = mask_blur.astype(np.float32) / 255.0
+mask_adapt = cv.morphologyEx(
+    mask_adapt,
+    cv.MORPH_OPEN,
+    np.ones((5,5),np.uint8)
+)
 
-# Image érodée (réduction des étoiles)
-kernel_erode = np.ones((3, 3), np.uint8)
-Ierode = cv.erode(img_uint8, kernel_erode, iterations=3).astype(np.float32)
+mask_adapt = cv.dilate(mask_adapt, np.ones((5,5),np.uint8), iterations=2)
 
-# Image recomposée finale
-Ifinal = (M * Ierode) + ((1 - M) * Ioriginal)
-Ifinal = np.clip(Ifinal, 0, 255).astype(np.uint8)
+# ===============================
+# 6. FUSION DES MASQUES
+# ===============================
+mask_combined = cv.bitwise_or(mask_dao, mask_adapt)
 
-# (a) Étoiles fortement visibles
-stars_only = (M * Ioriginal)
-stars_only = np.clip(stars_only, 0, 255).astype(np.uint8)
+# Flou des masques
+mask_dao_blur = cv.GaussianBlur(mask_dao, (21,21), 0)
+mask_adapt_blur = cv.GaussianBlur(mask_adapt, (21,21), 0)
+mask_combined_blur = cv.GaussianBlur(mask_combined, (21,21), 0)
 
-# (b) Image star-less
-starless = Ierode
-starless = np.clip(starless, 0, 255).astype(np.uint8)
+M_dao = mask_dao_blur.astype(np.float32) / 255.0
+M_adapt = mask_adapt_blur.astype(np.float32) / 255.0
+M_combined = mask_combined_blur.astype(np.float32) / 255.0
 
-# (c) Masque d’étoiles
-mask_out = mask_blur
+# ===============================
+# 7. IMAGE ÉRODÉE
+# ===============================
+kernel_erode = np.ones((3,3), np.uint8)
+Ierode = cv.erode(img_uint8, kernel_erode, iterations=6).astype(np.float32)
 
-# (d) Image recomposée
-final_out = Ifinal
+# ===============================
+# 8. IMAGES FINALES
+# ===============================
+# DAO seul
+Ifinal_dao = (M_dao * Ierode) + ((1 - M_dao) * Ioriginal)
+Ifinal_dao = np.clip(Ifinal_dao, 0, 255).astype(np.uint8)
 
-# Sauvegardes 
-cv.imwrite('./results/original.png', img_uint8)
-cv.imwrite('./results/b_starless.png', starless)
-cv.imwrite('./results/c_star_mask.png', mask_out)
-cv.imwrite('./results/d_final_recomposed.png', final_out)
+# Adaptive seul
+Ifinal_adapt = (M_adapt * Ierode) + ((1 - M_adapt) * Ioriginal)
+Ifinal_adapt = np.clip(Ifinal_adapt, 0, 255).astype(np.uint8)
 
-# Affichage
+# Combiné (STAR-LESS FINAL)
+Ifinal_combined = (M_combined * Ierode) + ((1 - M_combined) * Ioriginal)
+Ifinal_combined = np.clip(Ifinal_combined, 0, 255).astype(np.uint8)
+
+# ===============================
+# 9. SAUVEGARDE DES RÉSULTATS
+# ===============================
+cv.imwrite('./results/a_original.png', img_uint8)
+cv.imwrite('./results/b_dao_only.png', Ifinal_dao)
+cv.imwrite('./results/c_adaptive_only.png', Ifinal_adapt)
+cv.imwrite('./results/d_starless_final.png', Ifinal_combined)
+
+# ===============================
+# 10. AFFICHAGE FINAL
+# ===============================
 plt.figure(figsize=(18, 10))
 
 plt.subplot(2, 2, 1)
@@ -86,18 +118,18 @@ plt.imshow(img_uint8, cmap='gray')
 plt.axis('off')
 
 plt.subplot(2, 2, 2)
-plt.title("(b) Image star-less")
-plt.imshow(starless, cmap='gray')
+plt.title("(b) Réduction étoiles – DAO seul")
+plt.imshow(Ifinal_dao, cmap='gray')
 plt.axis('off')
 
 plt.subplot(2, 2, 3)
-plt.title("(c) Masque d’étoiles")
-plt.imshow(M, cmap='gray')
+plt.title("(c) Réduction étoiles – Adaptive threshold seul")
+plt.imshow(Ifinal_adapt, cmap='gray')
 plt.axis('off')
 
 plt.subplot(2, 2, 4)
-plt.title("(d) Image recomposée finale")
-plt.imshow(final_out, cmap='gray')
+plt.title("(d) Image star-less finale (filtres combinés)")
+plt.imshow(Ifinal_combined, cmap='gray')
 plt.axis('off')
 
 plt.tight_layout()
