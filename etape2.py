@@ -79,36 +79,45 @@ M_adapt = mask_adapt_blur.astype(np.float32) / 255.0
 M_combined = mask_combined_blur.astype(np.float32) / 255.0
 
 # ===============================
-# 7. IMAGE ÉRODÉE
+# 7. IMAGE ÉRODÉE (réduction étoiles)
 # ===============================
 kernel_erode = np.ones((3,3), np.uint8)
 Ierode = cv.erode(img_uint8, kernel_erode, iterations=6).astype(np.float32)
 
 # ===============================
-# 8. IMAGES FINALES
+# 8. IMAGES FINALES AVANT CORRECTION
 # ===============================
-# DAO seul
 Ifinal_dao = (M_dao * Ierode) + ((1 - M_dao) * Ioriginal)
 Ifinal_dao = np.clip(Ifinal_dao, 0, 255).astype(np.uint8)
 
-# Adaptive seul
 Ifinal_adapt = (M_adapt * Ierode) + ((1 - M_adapt) * Ioriginal)
 Ifinal_adapt = np.clip(Ifinal_adapt, 0, 255).astype(np.uint8)
 
-# Combiné (STAR-LESS FINAL)
 Ifinal_combined = (M_combined * Ierode) + ((1 - M_combined) * Ioriginal)
 Ifinal_combined = np.clip(Ifinal_combined, 0, 255).astype(np.uint8)
 
 # ===============================
-# 9. SAUVEGARDE DES RÉSULTATS
+# 9. CORRECTION DES TACHES NOIRES (SOLUTION 1)
+# ===============================
+# Lissage très léger
+blur_final = cv.GaussianBlur(Ifinal_combined, (3,3), 0)
+
+# Application UNIQUEMENT sous le masque combiné
+Ifinal_corrected = (M_combined * blur_final.astype(np.float32)) + \
+                   ((1 - M_combined) * Ifinal_combined.astype(np.float32))
+
+Ifinal_corrected = np.clip(Ifinal_corrected, 0, 255).astype(np.uint8)
+
+# ===============================
+# 10. SAUVEGARDE
 # ===============================
 cv.imwrite('./results/a_original.png', img_uint8)
 cv.imwrite('./results/b_dao_only.png', Ifinal_dao)
 cv.imwrite('./results/c_adaptive_only.png', Ifinal_adapt)
-cv.imwrite('./results/d_starless_final.png', Ifinal_combined)
+cv.imwrite('./results/d_starless_final.png', Ifinal_corrected)
 
 # ===============================
-# 10. AFFICHAGE FINAL
+# 11. AFFICHAGE FINAL
 # ===============================
 plt.figure(figsize=(18, 10))
 
@@ -128,8 +137,8 @@ plt.imshow(Ifinal_adapt, cmap='gray')
 plt.axis('off')
 
 plt.subplot(2, 2, 4)
-plt.title("(d) Image star-less finale (filtres combinés)")
-plt.imshow(Ifinal_combined, cmap='gray')
+plt.title("(d) Image star-less finale (corrigée)")
+plt.imshow(Ifinal_corrected, cmap='gray')
 plt.axis('off')
 
 plt.tight_layout()
