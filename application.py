@@ -70,6 +70,13 @@ class StarReductionApp:
         self.root.geometry("1200x850")
 
         self.fits_path = None
+        self.images = {}
+        self.blinking = False
+        self.blink_index = 0
+        self.blink_images = []
+        
+        self.update_timer = None
+        self.update_delay = 300 # ms
 
         self.build_controls()
         self.build_figure()
@@ -86,16 +93,10 @@ class StarReductionApp:
         ).pack(side="left", padx=10)
 
         self.fwhm_var = tk.DoubleVar(value=3.0)
-        self.slider(
-            controls, "FWHM",
-            self.fwhm_var, 1.0, 10.0, 0.1
-        )
+        self.slider(controls, "FWHM", self.fwhm_var, 1.0, 10.0, 0.1)
 
         self.sigma_var = tk.DoubleVar(value=1.0)
-        self.slider(
-            controls, "Seuil (σ)",
-            self.sigma_var, 0.0, 10.0, 0.1
-        )
+        self.slider(controls, "Seuil (σ)", self.sigma_var, 0.0, 10.0, 0.1)
 
         tk.Button(
             controls,
@@ -103,33 +104,36 @@ class StarReductionApp:
             command=self.run
         ).pack(side="left", padx=20)
 
+        tk.Button(
+            controls,
+            text="Clignotement Avant/Après",
+            command=self.toggle_blink
+        ).pack(side="left", padx=10)
+
+        # Mise à jour en temps réel des sliders
+        self.fwhm_var.trace_add("write", lambda *args: self.schedule_update())
+        self.sigma_var.trace_add("write", lambda *args: self.schedule_update())
+
     def slider(self, parent, label, variable, vmin, vmax, step):
         frame = tk.Frame(parent)
         frame.pack(side="left", padx=20)
 
         tk.Label(frame, text=label).pack()
-
-        tk.Entry(
-            frame,
-            textvariable=variable,
-            width=6,
-            justify="center"
-        ).pack(pady=2)
-
-        tk.Scale(
-            frame,
-            variable=variable,
-            from_=vmin,
-            to=vmax,
-            resolution=step,
-            orient="horizontal",
-            length=200
-        ).pack()
+        tk.Entry(frame, textvariable=variable, width=6, justify="center").pack(pady=2)
+        tk.Scale(frame, variable=variable, from_=vmin, to=vmax,
+                 resolution=step, orient="horizontal", length=200).pack()
 
     def build_figure(self):
         self.fig, self.axes = plt.subplots(2, 2, figsize=(10, 8))
+        self.fig.tight_layout()
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
         self.canvas.get_tk_widget().pack(expand=True)
+        
+        self.ax_images = []
+        for ax in self.axes.flat:
+            img = ax.imshow(np.zeros((100, 100)), cmap="gray", animated=True)
+            ax.axis("off")
+            self.ax_images.append(img)
 
     # Actions
     def load_fits(self):
@@ -142,47 +146,69 @@ class StarReductionApp:
                 "FITS chargé",
                 os.path.basename(self.fits_path)
             )
-
+            self.update_image()
+            
     def run(self):
         if not self.fits_path:
-            messagebox.showerror(
-                "Erreur",
-                "Aucun fichier FITS chargé"
-            )
+            messagebox.showerror("Erreur", "Aucun fichier FITS chargé")
+            return
+        self.update_image()
+        messagebox.showinfo("Terminé", "Images sauvegardées dans le dossier /results")
+
+    def schedule_update(self):
+        """Planifie une mise à jour après un délai (debouncing)"""
+        if self.update_timer:
+            self.root.after_cancel(self.update_timer)
+        self.update_timer = self.root.after(self.update_delay, self.update_image)
+
+    def update_image(self):
+        """Recalcule les images avec les paramètres actuels et met à jour la figure"""
+        if not self.fits_path:
             return
 
         img, starless, mask, final = process_fits_image(
-            self.fits_path,
-            self.fwhm_var.get(),
-            self.sigma_var.get()
+            self.fits_path, self.fwhm_var.get(), self.sigma_var.get()
         )
 
-        titles = [
-            "Original",
-            "Starless",
-            "Masque étoiles",
-            "Final"
-        ]
+        self.images = {"img": img, "starless": starless, "mask": mask, "final": final}
 
+        # Pour clignotement
+        self.blink_images = [img, final]
+        self.blink_index = 0
+
+        titles = ["Original", "Starless", "Masque étoiles", "Final"]
         images = [img, starless, mask, final]
 
-        for ax, im, title in zip(self.axes.flat, images, titles):
-            ax.clear()
-            ax.imshow(im, cmap="gray")
+        for i, (ax, ax_img, im, title) in enumerate(zip(self.axes.flat, self.ax_images, images, titles)):
+            ax_img.set_data(im)
+            ax_img.set_clim(vmin=im.min(), vmax=im.max())
             ax.set_title(title)
-            ax.axis("off")
 
-        self.canvas.draw()
+        self.canvas.draw_idle()
 
+        # Sauvegarde
         os.makedirs("results", exist_ok=True)
         cv.imwrite("results/original.png", img)
         cv.imwrite("results/starless.png", starless)
         cv.imwrite("results/final.png", final)
+        
+    # Comparateur clignotant
+    def toggle_blink(self):
+        if not self.blink_images:
+            return
+        self.blinking = not self.blinking
+        if self.blinking:
+            self.blink_step()
 
-        messagebox.showinfo(
-            "Terminé",
-            "Images sauvegardées dans le dossier /results"
-        )
+    def blink_step(self):
+        if not self.blinking:
+            return
+        self.ax_images[0].set_data(self.blink_images[self.blink_index])
+        self.axes[0, 0].set_title("Avant/Après")
+        self.canvas.draw_idle()
+        
+        self.blink_index = 1 - self.blink_index
+        self.root.after(500, self.blink_step)
 
 # main
 if __name__ == "__main__":
