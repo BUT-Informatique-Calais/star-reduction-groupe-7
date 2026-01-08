@@ -28,27 +28,51 @@ BASE_DIR = get_base_dir()
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-
 # traitement image 
 
 def process_fits_image(path, fwhm, sigma_factor):
     with fits.open(path) as hdul:
         data = hdul[0].data.astype(np.float32)
 
-    # Normalisation
-    img_norm = cv.normalize(data, None, 0, 255, cv.NORM_MINMAX)
-    img = img_norm.astype(np.uint8)
-    original = img.astype(np.float32)
+    # Détection si image couleur ou monochrome
+    is_color = len(data.shape) == 3
+    
+    if is_color:
+        # Image couleur (3 canaux)
+        # Convertir en luminance pour la détection d'étoiles
+        if data.shape[0] == 3:  # Format (C, H, W)
+            data_gray = np.mean(data, axis=0)
+            data = np.transpose(data, (1, 2, 0))  # Convertir en (H, W, C)
+        else:  # Format (H, W, C)
+            data_gray = np.mean(data, axis=2)
+    else:
+        # Image monochrome
+        data_gray = data
 
-    # Statistiques
-    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
+    # Normalisation pour affichage
+    if is_color:
+        img_norm = np.zeros_like(data, dtype=np.uint8)
+        for i in range(3):
+            img_norm[:, :, i] = cv.normalize(data[:, :, i], None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+        img = img_norm
+        original = img.astype(np.float32)
+    else:
+        img_norm = cv.normalize(data, None, 0, 255, cv.NORM_MINMAX)
+        img = img_norm.astype(np.uint8)
+        original = img.astype(np.float32)
 
-    # Détection étoiles
+    # Statistiques sur l'image en niveaux de gris
+    mean, median, std = sigma_clipped_stats(data_gray, sigma=3.0)
+
+    # Détection étoiles sur l'image en niveaux de gris
     finder = DAOStarFinder(fwhm=fwhm, threshold=sigma_factor * std)
-    sources = finder(data - median)
+    sources = finder(data_gray - median)
 
     # Masque
-    mask = np.zeros(img.shape, dtype=np.uint8)
+    if is_color:
+        mask = np.zeros((data.shape[0], data.shape[1]), dtype=np.uint8)
+    else:
+        mask = np.zeros(img.shape, dtype=np.uint8)
 
     if sources is not None:
         for star in sources:
@@ -56,16 +80,44 @@ def process_fits_image(path, fwhm, sigma_factor):
             cv.circle(mask, (x, y), 5, 255, -1)
 
     kernel = np.ones((3, 3), np.uint8)
-    mask = cv.dilate(mask, kernel, iterations=1)
-    mask = cv.GaussianBlur(mask, (15, 15), 0)
+    mask = cv.dilate(mask, kernel, iterations=2)
+    mask = cv.GaussianBlur(mask, (25, 25), 0)
 
     mask_f = mask.astype(np.float32) / 255.0
-    starless = cv.erode(img, kernel, iterations=3).astype(np.float32)
+    
+    # Élargir encore plus le masque pour une transition douce
+    mask_f = cv.GaussianBlur(mask_f, (31, 31), 0)
 
-    final = (mask_f * starless) + ((1 - mask_f) * original)
-    final = np.clip(final, 0, 255).astype(np.uint8)
+    # Traitement différent selon couleur ou monochrome
+    if is_color:
+        starless = np.zeros_like(img, dtype=np.float32)
+        final = np.zeros_like(img, dtype=np.float32)
+        
+        for i in range(3):
+            channel = img[:, :, i].astype(np.float32)
+            # Utiliser un flou au lieu d'une érosion pour éviter les artefacts
+            starless_channel = cv.GaussianBlur(img[:, :, i], (7, 7), 0).astype(np.float32)
+            # Inpainting pour remplir les zones d'étoiles de manière plus naturelle
+            temp_mask = (mask > 127).astype(np.uint8) * 255
+            starless_channel = cv.inpaint(img[:, :, i], temp_mask, 3, cv.INPAINT_TELEA).astype(np.float32)
+            
+            starless[:, :, i] = starless_channel
+            final[:, :, i] = (mask_f * starless_channel) + ((1 - mask_f) * channel)
+        
+        # Appliquer un léger flou sur le résultat final pour lisser
+        final = cv.GaussianBlur(final, (3, 3), 0)
+        final = np.clip(final, 0, 255).astype(np.uint8)
+        starless = starless.astype(np.uint8)
+    else:
+        # Utiliser inpainting au lieu d'érosion
+        temp_mask = (mask > 127).astype(np.uint8) * 255
+        starless = cv.inpaint(img, temp_mask, 3, cv.INPAINT_TELEA).astype(np.float32)
+        final = (mask_f * starless) + ((1 - mask_f) * original)
+        final = cv.GaussianBlur(final, (3, 3), 0)
+        final = np.clip(final, 0, 255).astype(np.uint8)
+        starless = starless.astype(np.uint8)
 
-    return img, starless.astype(np.uint8), mask_f, final
+    return img, starless, mask_f, final, is_color
 
 
 # interface utilisateur 
@@ -78,6 +130,7 @@ class StarReductionApp:
 
         self.fits_path = None
         self.images = {}
+        self.is_color = False
         self.blinking = False
         self.blink_index = 0
         self.blink_images = []
@@ -168,7 +221,7 @@ class StarReductionApp:
         if not self.fits_path:
             return
 
-        img, starless, mask, final = process_fits_image(
+        img, starless, mask, final, self.is_color = process_fits_image(
             self.fits_path,
             self.fwhm_var.get(),
             self.sigma_var.get()
@@ -188,15 +241,32 @@ class StarReductionApp:
         imgs = [img, starless, mask, final]
 
         for ax, im_ax, data, title in zip(self.axes.flat, self.ax_images, imgs, titles):
-            im_ax.set_data(data)
-            im_ax.set_clim(data.min(), data.max())
+            # Gérer l'affichage couleur vs monochrome
+            if title == "Masque":
+                im_ax.set_data(data)
+                im_ax.set_clim(data.min(), data.max())
+                im_ax.set_cmap("gray")
+            elif self.is_color and len(data.shape) == 3:
+                im_ax.set_data(data)
+                im_ax.set_cmap(None)
+            else:
+                im_ax.set_data(data)
+                im_ax.set_clim(data.min(), data.max())
+                im_ax.set_cmap("gray")
+            
             ax.set_title(title)
 
         self.canvas.draw_idle()
 
-        cv.imwrite(os.path.join(RESULTS_DIR, "original.png"), img)
-        cv.imwrite(os.path.join(RESULTS_DIR, "starless.png"), starless)
-        cv.imwrite(os.path.join(RESULTS_DIR, "final.png"), final)
+        # Sauvegarder en BGR pour OpenCV
+        if self.is_color:
+            cv.imwrite(os.path.join(RESULTS_DIR, "original.png"), cv.cvtColor(img, cv.COLOR_RGB2BGR))
+            cv.imwrite(os.path.join(RESULTS_DIR, "starless.png"), cv.cvtColor(starless, cv.COLOR_RGB2BGR))
+            cv.imwrite(os.path.join(RESULTS_DIR, "final.png"), cv.cvtColor(final, cv.COLOR_RGB2BGR))
+        else:
+            cv.imwrite(os.path.join(RESULTS_DIR, "original.png"), img)
+            cv.imwrite(os.path.join(RESULTS_DIR, "starless.png"), starless)
+            cv.imwrite(os.path.join(RESULTS_DIR, "final.png"), final)
 
     # BLINK 
     def toggle_blink(self):
@@ -209,13 +279,21 @@ class StarReductionApp:
     def blink_step(self):
         if not self.blinking:
             return
-        self.ax_images[0].set_data(self.blink_images[self.blink_index])
+        
+        data = self.blink_images[self.blink_index]
+        self.ax_images[0].set_data(data)
+        
+        if self.is_color and len(data.shape) == 3:
+            self.ax_images[0].set_cmap(None)
+        else:
+            self.ax_images[0].set_cmap("gray")
+        
         self.axes[0, 0].set_title("Avant / Après")
         self.canvas.draw_idle()
 
         self.blink_index = 1 - self.blink_index
         self.root.after(500, self.blink_step)
-
+              
 
 # Main 
 if __name__ == "__main__":
