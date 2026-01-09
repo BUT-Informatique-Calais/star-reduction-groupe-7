@@ -3,11 +3,14 @@ import sys
 import cv2 as cv
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
+import threading
 
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, END, NORMAL, DISABLED
+from tkinter import scrolledtext
 
 from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
@@ -138,6 +141,11 @@ class StarReductionApp:
         self.update_timer = None
         self.update_delay = 300
 
+        # Variables batch
+        self.batch_running = False
+        self.batch_terminal = None
+        self.batch_progress = None
+
         self.build_controls()
         self.build_figure()
 
@@ -165,6 +173,13 @@ class StarReductionApp:
         tb.Button(
             controls, text="Avant / Après",
             command=self.toggle_blink
+        ).pack(side=LEFT, padx=10)
+
+        # AJOUT : Bouton Batch
+        tb.Button(
+            controls, text="🚀 Mode Batch",
+            command=self.open_batch_window,
+            bootstyle="success"
         ).pack(side=LEFT, padx=10)
 
         self.fwhm_var.trace_add("write", lambda *_: self.schedule_update())
@@ -293,6 +308,202 @@ class StarReductionApp:
 
         self.blink_index = 1 - self.blink_index
         self.root.after(500, self.blink_step)
+
+    # ---------- MODE BATCH (NOUVEAU) ----------
+    def open_batch_window(self):
+        """Ouvre une fenêtre pour le traitement batch"""
+        batch_win = tb.Toplevel(self.root)
+        batch_win.title("🚀 Mode Batch Processing")
+        batch_win.geometry("800x600")
+
+        # Frame pour les contrôles
+        ctrl_frame = tb.Frame(batch_win, padding=10)
+        ctrl_frame.pack(fill=X)
+
+        # Sélection dossier input
+        tb.Label(ctrl_frame, text="Dossier FITS:").grid(row=0, column=0, padx=5, pady=5, sticky=W)
+        self.batch_input_var = tb.StringVar()
+        tb.Entry(ctrl_frame, textvariable=self.batch_input_var, width=50).grid(row=0, column=1, padx=5, pady=5)
+        tb.Button(ctrl_frame, text="📂", command=self.select_batch_input).grid(row=0, column=2, padx=5, pady=5)
+
+        # Sélection dossier output
+        tb.Label(ctrl_frame, text="Dossier sortie:").grid(row=1, column=0, padx=5, pady=5, sticky=W)
+        self.batch_output_var = tb.StringVar()
+        tb.Entry(ctrl_frame, textvariable=self.batch_output_var, width=50).grid(row=1, column=1, padx=5, pady=5)
+        tb.Button(ctrl_frame, text="📁", command=self.select_batch_output).grid(row=1, column=2, padx=5, pady=5)
+
+        # Paramètres
+        param_frame = tb.Frame(ctrl_frame)
+        param_frame.grid(row=2, column=0, columnspan=3, pady=10)
+
+        tb.Label(param_frame, text="FWHM:").pack(side=LEFT, padx=5)
+        self.batch_fwhm_var = tb.DoubleVar(value=self.fwhm_var.get())
+        tb.Entry(param_frame, textvariable=self.batch_fwhm_var, width=8).pack(side=LEFT, padx=5)
+
+        tb.Label(param_frame, text="Sigma:").pack(side=LEFT, padx=5)
+        self.batch_sigma_var = tb.DoubleVar(value=self.sigma_var.get())
+        tb.Entry(param_frame, textvariable=self.batch_sigma_var, width=8).pack(side=LEFT, padx=5)
+
+        # Bouton de lancement
+        self.batch_btn = tb.Button(
+            ctrl_frame,
+            text="▶ Lancer le traitement batch",
+            command=lambda: self.run_batch(batch_win),
+            bootstyle="success"
+        )
+        self.batch_btn.grid(row=3, column=0, columnspan=3, pady=10)
+
+        # Terminal (zone de texte avec scrollbar)
+        term_frame = tb.LabelFrame(batch_win, text="📟 Terminal")
+        term_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+        self.batch_terminal = scrolledtext.ScrolledText(
+            term_frame,
+            wrap="word",
+            height=20,
+            bg="#1e1e1e",
+            fg="#00ff00",
+            font=("Consolas", 10)
+        )
+        self.batch_terminal.pack(fill=BOTH, expand=True, padx=5, pady=5)
+        self.batch_terminal.config(state=DISABLED)
+
+        # Progress bar
+        self.batch_progress = tb.Progressbar(
+            batch_win,
+            bootstyle="success-striped",
+            mode="determinate"
+        )
+        self.batch_progress.pack(fill=X, padx=10, pady=5)
+
+    def select_batch_input(self):
+        folder = filedialog.askdirectory(title="Sélectionner le dossier FITS")
+        if folder:
+            self.batch_input_var.set(folder)
+
+    def select_batch_output(self):
+        folder = filedialog.askdirectory(title="Sélectionner le dossier de sortie")
+        if folder:
+            self.batch_output_var.set(folder)
+
+    def log_to_terminal(self, message):
+        """Ajoute un message au terminal"""
+        if self.batch_terminal is None:
+            return
+        try:
+            self.batch_terminal.config(state=NORMAL)
+            self.batch_terminal.insert(END, message + "\n")
+            self.batch_terminal.see(END)
+            self.batch_terminal.config(state=DISABLED)
+            self.batch_terminal.update()
+        except:
+            pass
+
+    def run_batch(self, window):
+        """Lance le traitement batch dans un thread séparé"""
+        if self.batch_running:
+            messagebox.showwarning("En cours", "Un traitement batch est déjà en cours")
+            return
+
+        input_dir = self.batch_input_var.get()
+        output_dir = self.batch_output_var.get()
+
+        if not input_dir or not output_dir:
+            messagebox.showerror("Erreur", "Veuillez sélectionner les dossiers d'entrée et de sortie")
+            return
+
+        if not os.path.isdir(input_dir):
+            messagebox.showerror("Erreur", "Le dossier d'entrée n'existe pas")
+            return
+
+        # Désactiver le bouton
+        self.batch_btn.config(state=DISABLED, text="⏳ Traitement en cours...")
+
+        # Lancer dans un thread
+        thread = threading.Thread(
+            target=self.batch_process_thread,
+            args=(input_dir, output_dir, self.batch_fwhm_var.get(), self.batch_sigma_var.get())
+        )
+        thread.daemon = True
+        thread.start()
+
+    def batch_process_thread(self, input_dir, output_dir, fwhm, sigma):
+        """Traitement batch dans un thread séparé"""
+        self.batch_running = True
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Récupérer les fichiers
+        fits_files = sorted([
+            f for f in os.listdir(input_dir)
+            if f.lower().endswith((".fits", ".fit"))
+        ])
+
+        if not fits_files:
+            self.log_to_terminal("❌ Aucun fichier FITS trouvé")
+            self.batch_btn.config(state=NORMAL, text="▶ Lancer le traitement batch")
+            self.batch_running = False
+            return
+
+        self.log_to_terminal("="*60)
+        self.log_to_terminal("🚀 BATCH STAR REDUCTION")
+        self.log_to_terminal("="*60)
+        self.log_to_terminal(f"📂 Entrée  : {input_dir}")
+        self.log_to_terminal(f"📁 Sortie  : {output_dir}")
+        self.log_to_terminal(f"🔧 FWHM={fwhm}, Sigma={sigma}")
+        self.log_to_terminal(f"📊 Fichiers: {len(fits_files)}")
+        self.log_to_terminal("="*60)
+        self.log_to_terminal("")
+
+        success = 0
+        errors = 0
+
+        # Configurer la barre de progression
+        if self.batch_progress:
+            self.batch_progress["maximum"] = len(fits_files)
+            self.batch_progress["value"] = 0
+
+        for i, filename in enumerate(fits_files, start=1):
+            path = os.path.join(input_dir, filename)
+
+            try:
+                # Lire et traiter
+                _, _, _, final, is_color = process_fits_image(path, fwhm, sigma)
+
+                # Sauvegarder
+                base_name = Path(filename).stem
+                out_name = f"{base_name}_starless.png"
+                out_path = os.path.join(output_dir, out_name)
+
+                if is_color:
+                    cv.imwrite(out_path, cv.cvtColor(final, cv.COLOR_RGB2BGR))
+                else:
+                    cv.imwrite(out_path, final)
+
+                success += 1
+                self.log_to_terminal(f"[{i}/{len(fits_files)}] ✔ {filename}")
+
+            except Exception as e:
+                errors += 1
+                self.log_to_terminal(f"[{i}/{len(fits_files)}] ✖ {filename} - ERREUR: {str(e)}")
+
+            # Mettre à jour la progress bar
+            if self.batch_progress:
+                self.batch_progress["value"] = i
+
+        # Résumé
+        self.log_to_terminal("")
+        self.log_to_terminal("="*60)
+        self.log_to_terminal(f"✅ Traitement terminé")
+        self.log_to_terminal(f"   Succès : {success}/{len(fits_files)}")
+        if errors > 0:
+            self.log_to_terminal(f"   Erreurs: {errors}/{len(fits_files)}")
+        self.log_to_terminal("="*60)
+
+        # Réactiver le bouton
+        self.batch_btn.config(state=NORMAL, text="▶ Lancer le traitement batch")
+        self.batch_running = False
+
+        messagebox.showinfo("Terminé", f"Traitement terminé!\n{success} succès, {errors} erreurs")
               
 
 # Main 
